@@ -1,62 +1,50 @@
-import React, { useRef, useEffect, useMemo } from 'react';
+import React, { useRef, useEffect, useMemo, useState } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { useGLTF, Environment } from '@react-three/drei';
 import * as THREE from 'three';
 
 /* ------------------------------------------------------------------ */
-/*  Camera path — Catmull-Rom spline from tight cockpit to 3/4 hero    */
-/*  Each point: { pos: [x,y,z], look: [x,y,z], fov }                  */
-/*  Tune these once the real model is confirmed in place.             */
+/*  Car sits centered, always. It rotates idly on its own, tilts      */
+/*  toward the cursor, and reveals different angles as you scroll —   */
+/*  front 3/4, side profile, rear 3/4 — flaring carbon parts as each   */
+/*  angle settles. No camera path through cabin geometry at all.      */
 /* ------------------------------------------------------------------ */
-const CAMERA_KEYFRAMES = [
-  // 0.00 — inside cabin, tight on dash/wheel, shallow FOV (claustrophobic)
-  { pos: [0.15, 0.95, 0.25], look: [0.0, 0.85, -0.4], fov: 32 },
-  // 0.12 — still inside, slight push toward windshield
-  { pos: [0.05, 1.0, 0.45], look: [0.0, 0.9, -1.0], fov: 35 },
-  // 0.28 — breaking through the glass, hood comes into view
-  { pos: [-0.3, 1.15, 1.6], look: [0.0, 0.7, -2.0], fov: 40 },
-  // 0.42 — front 3/4, grille + lip flare
-  { pos: [-1.8, 1.0, 3.0], look: [0.0, 0.55, 0.5], fov: 42 },
-  // 0.58 — side profile sweep, side skirts flare
-  { pos: [-4.2, 0.9, 1.2], look: [0.0, 0.5, -0.5], fov: 40 },
-  // 0.74 — rear 3/4, diffuser + spoiler flare
-  { pos: [-3.6, 0.85, -3.4], look: [0.2, 0.5, -1.0], fov: 38 },
-  // 1.00 — final hero rest position, full car 3/4 angle
-  { pos: [-3.0, 1.2, 4.2], look: [0.0, 0.6, 0.0], fov: 36 },
+
+// Scroll progress maps to these target Y-rotations (radians) for the car itself.
+// Car starts front-ish, sweeps through side, ends rear 3/4.
+const ROTATION_STOPS = [
+  { t: 0.0,  ry: 0.35 },   // front 3/4
+  { t: 0.30, ry: 1.55 },   // side profile
+  { t: 0.62, ry: 2.6  },   // rear 3/4
+  { t: 1.0,  ry: 3.5  },   // final hero rear-side angle
 ];
 
-function catmullRomVec3Array(points) {
-  const vecs = points.map((p) => new THREE.Vector3(...p));
-  return new THREE.CatmullRomCurve3(vecs, false, 'catmullrom', 0.5);
+function rotationAt(t) {
+  const stops = ROTATION_STOPS;
+  for (let i = 0; i < stops.length - 1; i++) {
+    if (t >= stops[i].t && t <= stops[i + 1].t) {
+      const localT = (t - stops[i].t) / (stops[i + 1].t - stops[i].t);
+      const eased = localT * localT * (3 - 2 * localT); // smoothstep
+      return THREE.MathUtils.lerp(stops[i].ry, stops[i + 1].ry, eased);
+    }
+  }
+  return stops[stops.length - 1].ry;
 }
 
-const posCurve = catmullRomVec3Array(CAMERA_KEYFRAMES.map((k) => k.pos));
-const lookCurve = catmullRomVec3Array(CAMERA_KEYFRAMES.map((k) => k.look));
-const fovs = CAMERA_KEYFRAMES.map((k) => k.fov);
-
-function fovAt(t) {
-  const n = fovs.length - 1;
-  const seg = Math.min(Math.floor(t * n), n - 1);
-  const localT = t * n - seg;
-  return THREE.MathUtils.lerp(fovs[seg], fovs[seg + 1], localT);
-}
-
-/* ------------------------------------------------------------------ */
-/*  Part flare map — mesh-name substrings to flare at specific          */
-/*  progress windows, matching the brief's "physical sequence" idea    */
-/* ------------------------------------------------------------------ */
+// Carbon parts to flare as their "good angle" comes into view during the sweep
 const FLARE_WINDOWS = [
-  { match: /hood/i, start: 0.30, end: 0.42 },
-  { match: /grille/i, start: 0.34, end: 0.46 },
-  { match: /kit0_carbon|carbon/i, start: 0.40, end: 0.58 }, // front lip / carbon kit
-  { match: /wing/i, start: 0.66, end: 0.80 }, // spoiler
+  { match: /hood/i, start: 0.0, end: 0.18 },
+  { match: /grille/i, start: 0.0, end: 0.2 },
+  { match: /kit0_carbon|carbon/i, start: 0.22, end: 0.5 },
+  { match: /wing/i, start: 0.55, end: 0.85 },
 ];
 
-function CarModel({ progress, onFlareTargets }) {
+function CarModel({ progress, mouse, onFlareTargets }) {
   const { scene } = useGLTF('/models/m4_placeholder.glb');
-  const flareMeshes = useRef([]);
+  const groupRef = useRef();
+  const tiltCurrent = useRef({ x: 0, y: 0 });
+  const baseRotation = useRef(0);
 
-  // Walk the scene once, tag materials, collect flare targets
   const clonedScene = useMemo(() => {
     const clone = scene.clone(true);
     const targets = [];
@@ -66,7 +54,6 @@ function CarModel({ progress, onFlareTargets }) {
       child.castShadow = true;
       child.receiveShadow = true;
 
-      // Boost material realism: carbon should read matte, paint glossy
       if (child.material) {
         const mat = child.material;
         const name = (child.name || '') + ' ' + (mat.name || '');
@@ -97,104 +84,114 @@ function CarModel({ progress, onFlareTargets }) {
     return clone;
   }, [scene, onFlareTargets]);
 
-  // Idle breathing rotation when not actively scrolling (handled by parent via small offset)
-  return <primitive object={clonedScene} scale={1} position={[0, -0.05, 0]} />;
-}
+  useFrame((state, delta) => {
+    if (!groupRef.current) return;
 
-function RigCamera({ progress }) {
-  const { camera } = useThree();
-  const smoothed = useRef(0);
+    // Scroll-driven base rotation (the "reveal sweep")
+    baseRotation.current = THREE.MathUtils.lerp(
+      baseRotation.current,
+      rotationAt(progress),
+      0.06
+    );
 
-  useFrame(() => {
-    // Ease camera progress toward scroll progress for weighty, non-jittery motion
-    smoothed.current = THREE.MathUtils.lerp(smoothed.current, progress, 0.08);
-    const t = smoothed.current;
+    // Idle breathing rotation layered on top — slow, alive, patient
+    const idle = Math.sin(state.clock.elapsedTime * 0.15) * 0.03;
 
-    const pos = posCurve.getPoint(t);
-    const look = lookCurve.getPoint(t);
+    // Cursor magnetism — tilt toward pointer, max ~15deg, weighted return
+    const targetTiltY = mouse.current.x * 0.26; // ~15deg max
+    const targetTiltX = -mouse.current.y * 0.14; // ~8deg max, gentler vertically
+    tiltCurrent.current.x = THREE.MathUtils.lerp(tiltCurrent.current.x, targetTiltX, 0.05);
+    tiltCurrent.current.y = THREE.MathUtils.lerp(tiltCurrent.current.y, targetTiltY, 0.05);
 
-    camera.position.copy(pos);
-    camera.up.set(0, 1, 0);
-    camera.lookAt(look);
-    if (camera.isPerspectiveCamera) {
-      camera.fov = fovAt(t);
-      camera.updateProjectionMatrix();
-    }
+    groupRef.current.rotation.y = baseRotation.current + idle + tiltCurrent.current.y;
+    groupRef.current.rotation.x = tiltCurrent.current.x;
   });
 
-  return null;
+  return (
+    <group ref={groupRef}>
+      <primitive object={clonedScene} scale={1} position={[0, 0, 0]} />
+    </group>
+  );
 }
 
 function FlareLights({ progress, flareTargets }) {
-  const groupRef = useRef();
-
-  useFrame((state) => {
-    if (!groupRef.current) return;
-    flareTargets.forEach(({ mesh, start, end }, i) => {
+  useFrame(() => {
+    flareTargets.forEach(({ mesh, start, end }) => {
       if (!mesh.material) return;
       const inWindow = progress >= start && progress <= end + 0.04;
       const localT = THREE.MathUtils.clamp((progress - start) / (end - start), 0, 1);
-      // pulse curve: rises then settles, like a quick flare not a steady glow
       const pulse = inWindow ? Math.sin(localT * Math.PI) * 0.9 : 0;
-      const targetEmissive = pulse;
-      if (mesh.material.emissive) {
-        mesh.material.emissiveIntensity = THREE.MathUtils.lerp(
-          mesh.material.emissiveIntensity || 0,
-          targetEmissive,
-          0.15
-        );
-        if (!mesh.material.emissive.getHex()) {
-          mesh.material.emissive = new THREE.Color('#d98a3d'); // warm amber flare
-        }
+      if (!mesh.material.emissive) {
+        mesh.material.emissive = new THREE.Color('#d98a3d');
       }
+      mesh.material.emissiveIntensity = THREE.MathUtils.lerp(
+        mesh.material.emissiveIntensity || 0,
+        pulse,
+        0.15
+      );
     });
   });
-
-  return <group ref={groupRef} />;
+  return null;
 }
 
 function SceneLighting() {
   return (
     <>
-      <ambientLight intensity={0.25} color="#1a1410" />
-      {/* Key rim light — warm, raking across the car */}
-      <directionalLight
-        position={[-6, 4, 2]}
-        intensity={2.2}
-        color="#e8a558"
-        castShadow
-      />
-      {/* Cool fill from "outside world" steel blue */}
-      <directionalLight position={[5, 3, -4]} intensity={0.5} color="#5a7a9a" />
-      {/* Low warm bounce, like cabin ambience */}
-      <pointLight position={[0, 0.6, 0]} intensity={0.4} color="#c47a32" distance={4} />
+      <ambientLight intensity={0.3} color="#1a1410" />
+      <directionalLight position={[-12, 8, 4]} intensity={2.2} color="#e8a558" castShadow />
+      <directionalLight position={[10, 6, -8]} intensity={0.5} color="#5a7a9a" />
+      <pointLight position={[0, 3, 8]} intensity={0.5} color="#c47a32" distance={20} />
     </>
   );
 }
 
+function FixedCamera() {
+  const { camera } = useThree();
+  useEffect(() => {
+    camera.position.set(0, 2.2, 19);
+    camera.lookAt(0, -0.2, 0);
+    if (camera.isPerspectiveCamera) {
+      camera.fov = 32;
+      camera.updateProjectionMatrix();
+    }
+  }, [camera]);
+  return null;
+}
+
 export default function CarScene({ progress }) {
   const flareTargetsRef = useRef([]);
+  const mouse = useRef({ x: 0, y: 0 });
+
+  useEffect(() => {
+    function handleMove(e) {
+      mouse.current.x = (e.clientX / window.innerWidth) * 2 - 1;
+      mouse.current.y = (e.clientY / window.innerHeight) * 2 - 1;
+    }
+    window.addEventListener('mousemove', handleMove, { passive: true });
+    return () => window.removeEventListener('mousemove', handleMove);
+  }, []);
 
   return (
     <Canvas
       shadows
       dpr={[1, 2]}
       gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping, toneMappingExposure: 1.1 }}
-      camera={{ fov: 32, near: 0.05, far: 100 }}
+      camera={{ fov: 32, near: 0.1, far: 200 }}
     >
       <color attach="background" args={['#0a0807']} />
-      <fog attach="fog" args={['#0a0807', 8, 22]} />
+      <fog attach="fog" args={['#0a0807', 22, 55]} />
       <SceneLighting />
       <Environment preset="city" />
 
       <React.Suspense fallback={null}>
         <CarModel
           progress={progress}
+          mouse={mouse}
           onFlareTargets={(targets) => (flareTargetsRef.current = targets)}
         />
       </React.Suspense>
 
-      <RigCamera progress={progress} />
+      <FixedCamera />
       <FlareLights progress={progress} flareTargets={flareTargetsRef.current} />
     </Canvas>
   );
