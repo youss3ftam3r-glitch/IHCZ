@@ -205,7 +205,9 @@ export default function ScrollCopy({ onProgress }) {
           zIndex: 3,
         }}
       >
-        Placeholder model by vecarz (CC BY-NC-SA 4.0) — for development only
+        3D model: BMW M4 Modified Widebody by{' '}
+        <a href="https://sketchfab.com/3d-models/bmw-m4-modified-widebody-knitro-builds-6e325ec23a0f41c08366472b34b8f8c8" target="_blank" rel="noreferrer" style={{ color: 'inherit' }}>knitro_builds</a>
+        {' '}— <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noreferrer" style={{ color: 'inherit' }}>CC BY 4.0</a>; materials and presentation adapted
       </div>
     </div>
   );

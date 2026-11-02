@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useMemo, useState } from 'react';
+import React, { useRef, useEffect, useMemo, useCallback } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { useGLTF, Environment } from '@react-three/drei';
 import * as THREE from 'three';
@@ -45,7 +45,7 @@ function CarModel({ progress, mouse, onFlareTargets }) {
   const tiltCurrent = useRef({ x: 0, y: 0 });
   const baseRotation = useRef(0);
 
-  const clonedScene = useMemo(() => {
+  const model = useMemo(() => {
     const clone = scene.clone(true);
     const targets = [];
 
@@ -55,6 +55,12 @@ function CarModel({ progress, mouse, onFlareTargets }) {
       child.receiveShadow = true;
 
       if (child.material) {
+        // Keep material changes local to this copy of the loaded model.
+        if (Array.isArray(child.material)) {
+          child.material = child.material.map((material) => material.clone());
+        } else {
+          child.material = child.material.clone();
+        }
         const mat = child.material;
         const name = (child.name || '') + ' ' + (mat.name || '');
         if (/carbon/i.test(name)) {
@@ -80,28 +86,41 @@ function CarModel({ progress, mouse, onFlareTargets }) {
       }
     });
 
-    onFlareTargets?.(targets);
-    return clone;
-  }, [scene, onFlareTargets]);
+    // GLB exports can have arbitrary units and origins. Normalize the car
+    // before rotating it so the whole vehicle stays centered in the frame.
+    clone.updateMatrixWorld(true);
+    const bounds = new THREE.Box3().setFromObject(clone);
+    const size = bounds.getSize(new THREE.Vector3());
+    const center = bounds.getCenter(new THREE.Vector3());
+    const scale = 10.5 / Math.max(size.x, size.y, size.z, 0.001);
+    return { scene: clone, targets, scale, offset: center.multiplyScalar(-1).toArray() };
+  }, [scene]);
+
+  useEffect(() => {
+    onFlareTargets(model.targets);
+  }, [model, onFlareTargets]);
 
   useFrame((state, delta) => {
     if (!groupRef.current) return;
 
     // Scroll-driven base rotation (the "reveal sweep")
-    baseRotation.current = THREE.MathUtils.lerp(
+    baseRotation.current = THREE.MathUtils.damp(
       baseRotation.current,
       rotationAt(progress),
-      0.06
+      4,
+      delta
     );
 
     // Idle breathing rotation layered on top — slow, alive, patient
     const idle = Math.sin(state.clock.elapsedTime * 0.15) * 0.03;
 
     // Cursor magnetism — tilt toward pointer, max ~15deg, weighted return
-    const targetTiltY = mouse.current.x * 0.26; // ~15deg max
-    const targetTiltX = -mouse.current.y * 0.14; // ~8deg max, gentler vertically
-    tiltCurrent.current.x = THREE.MathUtils.lerp(tiltCurrent.current.x, targetTiltX, 0.05);
-    tiltCurrent.current.y = THREE.MathUtils.lerp(tiltCurrent.current.y, targetTiltY, 0.05);
+    const targetTiltY = mouse.current.x * 0.22;
+    const targetTiltX = mouse.current.y * 0.10;
+    tiltCurrent.current.x = THREE.MathUtils.damp(tiltCurrent.current.x, targetTiltX, 5, delta);
+    tiltCurrent.current.y = THREE.MathUtils.damp(tiltCurrent.current.y, targetTiltY, 5, delta);
+    groupRef.current.position.x = THREE.MathUtils.damp(groupRef.current.position.x, mouse.current.x * 0.3, 5, delta);
+    groupRef.current.position.y = THREE.MathUtils.damp(groupRef.current.position.y, -mouse.current.y * 0.18, 5, delta);
 
     groupRef.current.rotation.y = baseRotation.current + idle + tiltCurrent.current.y;
     groupRef.current.rotation.x = tiltCurrent.current.x;
@@ -109,7 +128,9 @@ function CarModel({ progress, mouse, onFlareTargets }) {
 
   return (
     <group ref={groupRef}>
-      <primitive object={clonedScene} scale={1} position={[0, 0, 0]} />
+      <group scale={model.scale}>
+        <primitive object={model.scene} position={model.offset} />
+      </group>
     </group>
   );
 }
@@ -146,29 +167,43 @@ function SceneLighting() {
 }
 
 function FixedCamera() {
-  const { camera } = useThree();
+  const { camera, size } = useThree();
   useEffect(() => {
-    camera.position.set(0, 2.2, 19);
-    camera.lookAt(0, -0.2, 0);
     if (camera.isPerspectiveCamera) {
-      camera.fov = 32;
+      camera.fov = 36;
+      const aspect = size.width / Math.max(size.height, 1);
+      const distance = 6.6 / (Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * Math.min(aspect, 1));
+      camera.position.set(0, distance * 0.12, distance);
+      camera.lookAt(0, 0, 0);
       camera.updateProjectionMatrix();
     }
-  }, [camera]);
+  }, [camera, size.width, size.height]);
   return null;
 }
 
 export default function CarScene({ progress }) {
   const flareTargetsRef = useRef([]);
   const mouse = useRef({ x: 0, y: 0 });
+  const setFlareTargets = useCallback((targets) => {
+    flareTargetsRef.current = targets;
+  }, []);
 
   useEffect(() => {
     function handleMove(e) {
       mouse.current.x = (e.clientX / window.innerWidth) * 2 - 1;
       mouse.current.y = (e.clientY / window.innerHeight) * 2 - 1;
     }
-    window.addEventListener('mousemove', handleMove, { passive: true });
-    return () => window.removeEventListener('mousemove', handleMove);
+    function resetMouse() {
+      mouse.current = { x: 0, y: 0 };
+    }
+    window.addEventListener('pointermove', handleMove, { passive: true });
+    document.documentElement.addEventListener('pointerleave', resetMouse);
+    window.addEventListener('blur', resetMouse);
+    return () => {
+      window.removeEventListener('pointermove', handleMove);
+      document.documentElement.removeEventListener('pointerleave', resetMouse);
+      window.removeEventListener('blur', resetMouse);
+    };
   }, []);
 
   return (
@@ -187,7 +222,7 @@ export default function CarScene({ progress }) {
         <CarModel
           progress={progress}
           mouse={mouse}
-          onFlareTargets={(targets) => (flareTargetsRef.current = targets)}
+          onFlareTargets={setFlareTargets}
         />
       </React.Suspense>
 
